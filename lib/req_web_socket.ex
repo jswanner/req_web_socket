@@ -522,27 +522,11 @@ defmodule ReqWebSocket do
   end
 
   defp web_socket_upgrade(request, conn, ref) do
-    socket = Mint.HTTP.get_socket(conn)
-    scheme = Mint.HTTP.get_private(conn, :scheme)
+    require Mint.HTTP
 
-    message =
-      case scheme do
-        :ws ->
-          receive do
-            {:tcp, ^socket, _data} = msg -> msg
-            {:tcp_closed, ^socket} = msg -> msg
-            {:tcp_error, ^socket, _reason} = msg -> msg
-          end
-
-        :wss ->
-          receive do
-            {:ssl, ^socket, _data} = msg -> msg
-            {:ssl_closed, ^socket} = msg -> msg
-            {:ssl_error, ^socket, _reason} = msg -> msg
-          end
-      end
-
-    with {:ok, conn, responses} <- Mint.WebSocket.stream(conn, message),
+    with message <-
+           receive(do: (message when Mint.HTTP.is_connection_message(conn, message) -> message)),
+         {:ok, conn, responses} <- Mint.WebSocket.stream(conn, message),
          [{:status, ^ref, status}, {:headers, ^ref, headers}, {:done, ^ref}] <-
            web_socket_upgrade_maybe_pop_data(conn, ref, responses),
          {:ok, conn, web_socket} <- Mint.WebSocket.new(conn, ref, status, headers) do
