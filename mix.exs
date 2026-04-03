@@ -44,8 +44,8 @@ defmodule ReqWebSocket.MixProject do
         }
       ],
       source_url: @source_url,
-      version: "0.1.0",
-      start_permanent: Mix.env() == :prod
+      start_permanent: Mix.env() == :prod,
+      version: @version
     ]
   end
 end
