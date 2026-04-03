@@ -2,12 +2,16 @@ defmodule ReqWebSocket.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/jswanner/req_web_socket"
-  @version "0.1.0"
+  @version "0.1.1"
 
   def application do
     [
       extra_applications: [:logger]
     ]
+  end
+
+  def cli do
+    [preferred_envs: [docs: :docs, "hex.publish": :docs]]
   end
 
   defp deps do
@@ -38,10 +42,6 @@ defmodule ReqWebSocket.MixProject do
         links: %{
           "GitHub" => @source_url
         }
-      ],
-      preferred_cli_env: [
-        docs: :docs,
-        "hex.publish": :docs
       ],
       source_url: @source_url,
       version: "0.1.0",
