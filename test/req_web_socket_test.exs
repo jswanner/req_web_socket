@@ -139,6 +139,23 @@ defmodule ReqWebSocketTest do
       assert_receive {:ok, _resp, [ping: ""]}
     end
 
+    test "does not intercept unrelated messages from mailbox", context do
+      spawn(fn ->
+        ref = make_ref()
+        send(self(), ref)
+
+        {:ok, resp} = Req.get(context.req, into: :self)
+
+        assert_receive ^ref
+
+        receive do
+          message -> send(context.test, ReqWebSocket.parse_message(resp, message))
+        end
+      end)
+
+      assert_receive {:ok, _resp, [ping: ""]}
+    end
+
     @tag handler_action: nil
     test "sends frame", context do
       spawn(fn ->
