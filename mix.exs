@@ -2,7 +2,7 @@ defmodule ReqWebSocket.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/jswanner/req_web_socket"
-  @version "0.1.1"
+  @version "0.1.2"
 
   def application do
     [
@@ -19,7 +19,7 @@ defmodule ReqWebSocket.MixProject do
       {:bandit, "~> 1.7", only: :test},
       {:ex_doc, ">= 0.0.0", only: :docs, runtime: false, warn_if_outdated: true},
       {:mint_web_socket, "~> 1.0"},
-      {:req, "~> 0.5.0"},
+      {:req, "~> 0.5.0 or ~> 0.6.0"},
       {:websock_adapter, "~> 0.5.8", only: :test},
       {:x509, "~> 0.9.0", only: :test}
     ]
