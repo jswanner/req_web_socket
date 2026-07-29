@@ -331,10 +331,10 @@ defmodule ReqWebSocket do
     request
     |> Req.Request.put_private(:http_scheme, http_scheme)
     |> Req.Request.put_private(:ws_scheme, ws_scheme)
-    |> Map.put(:adapter, &run_web_socket/1)
+    |> Map.put(:adapter, __MODULE__)
   end
 
-  defp run_web_socket(request) do
+  def run(request) do
     case request.into do
       fun when is_function(fun, 2) -> run_web_socket_fun(request)
       :self -> run_web_socket_self(request)

@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## v0.2.0 (2026-07-29)
+
+  * Resolve deprecation for Req >= v0.7 (drop support for < v0.7)
+
 ## v0.1.2 (2026-06-16)
 
   * Bump req requirement to allow ~> 0.6.0
