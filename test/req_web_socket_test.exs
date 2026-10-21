@@ -1,7 +1,9 @@
 defmodule ReqWebSocketTest do
   use ExUnit.Case, async: true
 
-  @moduletag handler_action: {:ping, ""}, schemes: {:http, :ws}, send_conn: false
+  @moduletag handler_action: {:ping, ""},
+             schemes: {:http, :ws},
+             send_conn: false
 
   setup context do
     Process.register(self(), context.test)
@@ -14,24 +16,24 @@ defmodule ReqWebSocketTest do
     @describetag :send_conn
 
     test "http for ws", context do
-      spawn(fn -> Req.get(context.req, into: :self) end)
+      spawn_link(fn -> Req.get(context.req, into: :self) end)
       assert_receive %{scheme: :http}
     end
 
     @tag schemes: {:https, :wss}
     test "https for wss", context do
-      spawn(fn -> Req.get(context.req, into: :self) end)
+      spawn_link(fn -> Req.get(context.req, into: :self) end)
       assert_receive %{scheme: :https}
     end
 
     test "includes headers", context do
-      spawn(fn -> Req.get(context.req, auth: {:bearer, "token"}, into: :self) end)
+      spawn_link(fn -> Req.get(context.req, auth: {:bearer, "token"}, into: :self) end)
       assert_receive conn
       assert {"authorization", "Bearer token"} in conn.req_headers
     end
 
     test "supports path params", context do
-      spawn(fn ->
+      spawn_link(fn ->
         Req.get(context.req, path_params: [token: "foo"], url: "/:token", into: :self)
       end)
 
@@ -40,14 +42,14 @@ defmodule ReqWebSocketTest do
     end
 
     test "includes query params", context do
-      spawn(fn -> Req.get(context.req, params: [token: "foo"], into: :self) end)
+      spawn_link(fn -> Req.get(context.req, params: [token: "foo"], into: :self) end)
 
       assert_receive conn
       assert conn.query_string == "token=foo"
     end
 
     test "supports AWS signature", context do
-      spawn(fn ->
+      spawn_link(fn ->
         Req.get(context.req,
           aws_sigv4: [access_key_id: "id", secret_access_key: "key", service: :s3],
           into: :self
@@ -66,58 +68,102 @@ defmodule ReqWebSocketTest do
     end
   end
 
-  describe "into: fun" do
+  describe "stream/4" do
     test "receives ping as fun argument", context do
-      assert {:ok, _resp} =
-               Req.get(context.req,
-                 into: fn {:data, frames}, {req, resp} ->
-                   send(context.test, frames)
-                   {:halt, {req, resp}}
-                 end
-               )
-
-      assert_receive [{:ping, ""}]
+      assert {:ok, _resp, [ping: ""]} =
+               Req.stream(context.req, [], fn frames, _resp, acc ->
+                 {:halt, acc ++ frames}
+               end)
     end
 
     test "sends frame in response to ping", context do
-      assert {:ok, _resp} =
-               Req.get(context.req,
-                 into: fn
-                   {:data, ping: _}, {req, resp} ->
-                     {:cont, [{:text, "Hello, World"}], {req, resp}}
-
-                   {:data, text: text}, acc ->
-                     send(context.test, text)
-                     {:halt, acc}
-                 end
-               )
+      assert {:ok, _resp, _acc} =
+               Req.stream(context.req, [], fn [ping: ""], resp, acc ->
+                 ReqWebSocket.send_frame(resp, {:text, "Hello, World"})
+                 {:halt, acc}
+               end)
 
       assert_receive "in: Hello, World"
-    end
-
-    test "sends frame and halts", context do
-      assert {:ok, _resp} =
-               Req.get(context.req,
-                 into: fn
-                   {:data, ping: _}, {req, resp} ->
-                     {:halt, [{:text, "Hello, World"}], {req, resp}}
-                 end
-               )
-
-      assert_receive "in: Hello, World"
+      refute_receive _
     end
 
     @tag :send_conn
     test "accommodates redirects", context do
-      spawn(fn -> Req.get(context.req, into: fn _, acc -> {:halt, acc} end, url: "/redirect") end)
+      assert {:ok, _resp, [ping: ""]} =
+               Req.stream(context.req, [], fn frames, _resp, acc -> {:halt, acc ++ frames} end,
+                 url: "/redirect"
+               )
+
       assert_receive %{request_path: "/"}
       refute_receive _
     end
 
     @tag :send_conn
     test "accommodates retries", context do
-      spawn(fn ->
-        Req.get(context.req, into: fn _, acc -> {:halt, acc} end, url: "/fail-once")
+      assert {:ok, _resp, _acc} =
+               Req.stream(
+                 context.req,
+                 [],
+                 fn [ping: ""], _resp, acc -> {:halt, acc} end,
+                 url: "/fail-once"
+               )
+
+      assert_receive %{request_path: "/fail-once"}
+      assert_receive %{request_path: "/fail-once"}
+      refute_receive _
+    end
+  end
+
+  describe "into: fun" do
+    import ExUnit.CaptureIO
+
+    test "receives ping as fun argument", context do
+      capture_io(:stderr, fn ->
+        assert {:ok, _resp} =
+                 Req.get(context.req,
+                   into: fn {:data, frames}, {req, resp} ->
+                     send(context.test, frames)
+                     {:halt, {req, resp}}
+                   end
+                 )
+      end)
+
+      assert_receive [{:ping, ""}]
+    end
+
+    test "sends frame in response to ping", context do
+      capture_io(:stderr, fn ->
+        assert {:ok, _resp} =
+                 Req.get(context.req,
+                   into: fn
+                     {:data, ping: _}, {req, resp} ->
+                       ReqWebSocket.send_frame(resp, {:text, "Hello, World"})
+                       {:halt, {req, resp}}
+                   end
+                 )
+      end)
+
+      assert_receive "in: Hello, World"
+    end
+
+    @tag :send_conn
+    test "accommodates redirects", context do
+      spawn_link(fn ->
+        capture_io(:stderr, fn ->
+          Req.get(context.req, into: fn _, acc -> {:halt, acc} end, url: "/redirect")
+        end)
+      end)
+
+      assert_receive %{request_path: "/"}
+      refute_receive _
+    end
+
+    @tag :send_conn
+    test "accommodates retries", context do
+      spawn_link(fn ->
+        capture_io(:stderr, fn ->
+          Req.get(context.req, into: fn _, acc -> {:halt, acc} end, url: "/fail-once")
+        end)
       end)
 
       assert_receive %{request_path: "/fail-once"}
@@ -128,19 +174,19 @@ defmodule ReqWebSocketTest do
 
   describe "into: :self" do
     test "receives ping in process mailbox", context do
-      spawn(fn ->
+      spawn_link(fn ->
         {:ok, resp} = Req.get(context.req, into: :self)
 
         receive do
-          message -> send(context.test, ReqWebSocket.parse_message(resp, message))
+          message -> send(context.test, Req.parse_message(resp, message))
         end
       end)
 
-      assert_receive {:ok, _resp, [ping: ""]}
+      assert_receive {:ok, [ping: ""]}, 1000
     end
 
     test "does not intercept unrelated messages from mailbox", context do
-      spawn(fn ->
+      spawn_link(fn ->
         ref = make_ref()
         send(self(), ref)
 
@@ -149,16 +195,16 @@ defmodule ReqWebSocketTest do
         assert_receive ^ref
 
         receive do
-          message -> send(context.test, ReqWebSocket.parse_message(resp, message))
+          message -> send(context.test, Req.parse_message(resp, message))
         end
       end)
 
-      assert_receive {:ok, _resp, [ping: ""]}
+      assert_receive {:ok, [ping: ""]}, 1000
     end
 
     @tag handler_action: nil
     test "sends frame", context do
-      spawn(fn ->
+      spawn_link(fn ->
         assert {:ok, resp} = Req.get(context.req, into: :self)
         assert {:ok, _resp} = ReqWebSocket.send_frame(resp, {:text, "Hello, World"})
       end)
@@ -168,38 +214,53 @@ defmodule ReqWebSocketTest do
 
     @tag handler_action: nil
     test "sends frames", context do
-      spawn(fn ->
+      spawn_link(fn ->
         assert {:ok, resp} = Req.get(context.req, into: :self)
         assert {:ok, _resp} = ReqWebSocket.send_frames(resp, [{:text, "Hello"}, {:ping, ""}])
 
         receive do
-          message -> send(context.test, ReqWebSocket.parse_message(resp, message))
+          message -> send(context.test, Req.parse_message(resp, message))
         end
       end)
 
       assert_receive "in: Hello"
-      assert_receive {:ok, _resp, [pong: ""]}
+      assert_receive {:ok, [pong: ""]}
     end
 
     @tag :send_conn
     test "accommodates redirects", context do
-      spawn(fn -> Req.get(context.req, into: :self, url: "/redirect") end)
+      spawn_link(fn ->
+        assert {:ok, resp} = Req.get(context.req, into: :self, url: "/redirect")
+
+        receive do
+          message -> send(context.test, Req.parse_message(resp, message))
+        end
+      end)
+
       assert_receive %{request_path: "/"}
+      assert_receive {:ok, [ping: ""]}
       refute_receive _
     end
 
     @tag :send_conn
     test "accommodates retries", context do
-      spawn(fn -> Req.get(context.req, into: :self, url: "/fail-once") end)
+      spawn_link(fn ->
+        assert {:ok, resp} = Req.get(context.req, into: :self, url: "/fail-once")
+
+        receive do
+          message -> send(context.test, Req.parse_message(resp, message))
+        end
+      end)
 
       assert_receive %{request_path: "/fail-once"}
       assert_receive %{request_path: "/fail-once"}
+      assert_receive {:ok, [ping: ""]}
       refute_receive _
     end
 
     @tag handler_action: nil
     test "closes connection", context do
-      spawn(fn ->
+      spawn_link(fn ->
         assert {:ok, resp} = Req.get(context.req, into: :self)
         assert {:ok, resp} = ReqWebSocket.close(resp)
         assert {:error, _resp, %{reason: :closed}} = ReqWebSocket.send_frame(resp, :ping)
@@ -210,9 +271,9 @@ defmodule ReqWebSocketTest do
   end
 
   test "unknown message parsing", context do
-    spawn(fn ->
+    spawn_link(fn ->
       {:ok, resp} = Req.get(context.req, into: :self)
-      send(context.test, ReqWebSocket.parse_message(resp, "junk"))
+      send(context.test, Req.parse_message(resp, "junk"))
     end)
 
     assert_receive :unknown
@@ -233,6 +294,7 @@ defmodule ReqWebSocketTest do
     end
 
     def init({nil, test}), do: {:ok, test}
+
     def init({action, test}), do: {:push, [action], test}
   end
 

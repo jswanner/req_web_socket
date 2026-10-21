@@ -2,7 +2,7 @@ defmodule ReqWebSocket.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/jswanner/req_web_socket"
-  @version "0.2.0"
+  @version "0.3.0-dev"
 
   def application do
     [
@@ -19,7 +19,7 @@ defmodule ReqWebSocket.MixProject do
       {:bandit, "~> 1.7", only: :test},
       {:ex_doc, ">= 0.0.0", only: :docs, runtime: false, warn_if_outdated: true},
       {:mint_web_socket, "~> 1.0"},
-      {:req, "~> 0.7.0"},
+      {:req, "~> 0.8.0-dev", req_opts()},
       {:websock_adapter, "~> 0.5.8 or ~> 0.6.0", only: :test},
       {:x509, "~> 0.9.0", only: :test}
     ]
@@ -47,5 +47,18 @@ defmodule ReqWebSocket.MixProject do
       start_permanent: Mix.env() == :prod,
       version: @version
     ]
+  end
+
+  defp req_opts do
+    cond do
+      path = System.get_env("REQ_PATH") ->
+        [path: path]
+
+      ref = System.get_env("REQ_REF") ->
+        [github: "wojtekmach/req", ref: ref]
+
+      true ->
+        []
+    end
   end
 end

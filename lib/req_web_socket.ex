@@ -5,18 +5,30 @@ defmodule ReqWebSocket do
 
   ## Examples
 
+      {:ok, _resp, [pong: ""]} =
+        Req.new("wss://echo.websocket.org/")
+        |> ReqWebSocket.attach()
+        |> Req.stream([], fn
+          [text: _], resp, acc ->
+            ReqWebSocket.send_frame(resp, :ping)
+            {:cont, acc}
+
+          frames, _resp, acc ->
+            {:halt, acc ++ frames}
+        end)
+
       resp =
         Req.new()
         |> ReqWebSocket.attach()
         |> Req.get!(into: :self, url: "wss://echo.websocket.org/")
 
       message = receive do message -> message end
-      {:ok, resp, [text: _]} = ReqWebSocket.parse_message(resp, message)
+      {:ok, [text: _]} = Req.parse_message(resp, message)
 
       {:ok, resp} = ReqWebSocket.send_frame(resp, :ping)
 
       message = receive do message -> message end
-      {:ok, resp, [pong: ""]} = ReqWebSocket.parse_message(resp, message)
+      {:ok, [pong: ""]} = Req.parse_message(resp, message)
   """
 
   defmodule UnsupportedIntoError do
@@ -33,6 +45,11 @@ defmodule ReqWebSocket do
       """
     end
   end
+
+  @behaviour Req.Adapter
+
+  @http_scheme Module.concat(__MODULE__, :http_scheme)
+  @ws_scheme Module.concat(__MODULE__, :ws_scheme)
 
   @doc """
   Adds the plugin to the `Req.Request` struct. Since this plugin replaces the
@@ -121,20 +138,21 @@ defmodule ReqWebSocket do
 
   * `:into` - where to send the response body. It can be one of:
 
-      * `fun` - stream response body using a function. The first argument is a `{:data, frames}`
-        tuple containing the message frames of the response body. The second argument is a
-        `{request, response}` tuple. To continue streaming frames, return `{:cont, {req, resp}}`
-        or `{:cont, frames, {req, resp}}`. To cancel, return `{:halt, {req, resp}}` or
-        `{:halt, frames, {req, resp}}`. See `send_frame/2` for supported frame
-        types. For example:
-
-            into: fn {:data, [{:ping, string}]}, {req, resp} ->
-              {:cont, [{:pong, string}], {req, resp}}
-            end
-
       * `:self` - stream response body into the current process mailbox.
 
-        Received messages should be parsed with `ReqWebSocket.parse_message/2`.
+        Received messages should be parsed with `Req.parse_message/2`.
+
+      * `fun` - (Deprecated) stream response body using a function. The first argument is a
+        `{:data, frames}` tuple containing the message frames of the response body. The second
+        argument is a `{request, response}` tuple. To continue streaming frames, return
+        `{:cont, {req, resp}}`. To cancel, return `{:halt, {req, resp}}`. See `send_frame/2` for
+        supported frame types.
+        For example:
+
+            into: fn {:data, [ping: string]}, {req, resp} ->
+              ReqWebSocket.send_frame(resp, {:pong, string})
+              {:cont, {req, resp}}
+            end
 
   Response redirect options ([`redirect`](`Req.Steps.redirect/1`) step):
 
@@ -217,7 +235,7 @@ defmodule ReqWebSocket do
   def attach(request, options \\ []) do
     request
     |> Req.Request.merge_options(options)
-    |> Req.Request.append_request_steps(put_web_socket: &put_web_socket/1)
+    |> Req.Request.append_request_steps(websocket: &put_websocket/1)
   end
 
   @doc """
@@ -244,208 +262,6 @@ defmodule ReqWebSocket do
       end)
 
     {:ok, response}
-  end
-
-  defp encode_frame(conn, web_socket, frame) do
-    case Mint.WebSocket.encode(web_socket, frame) do
-      {:ok, _websocket, _encoded} = result -> result
-      {:error, web_socket, reason} -> {:error, conn, web_socket, reason}
-    end
-  end
-
-  defp encode_frames(conn, web_socket, frames) do
-    Enum.reduce_while(frames, {:ok, web_socket, <<>>}, fn frame, {_, web_socket, acc} ->
-      case encode_frame(conn, web_socket, frame) do
-        {:ok, web_socket, encoded} -> {:cont, {:ok, web_socket, acc <> encoded}}
-        {:error, conn, web_socket, reason} -> {:halt, {:error, conn, web_socket, reason}}
-      end
-    end)
-  end
-
-  @doc """
-  Attempts to parse `message` into WebSocket frames, if the given `message` is
-  not from the connection's socket, this function returns `:unknown`.
-
-  A WebSocket frame:
-
-  * `{:binary, binary}` - a frame containing binary data. Binary frames
-    can be used to send arbitrary binary data such as a PDF.
-  * `{:close, code, reason}` - a control frame used to request that a connection
-    be closed or to acknowledge a close frame sent by the server.
-  * `{:ping, binary}` - a control frame which the server should respond to
-    with a pong. The binary data must be echoed in the pong response.
-  * `{:pong, binary}` - a control frame which forms a reply to a ping frame.
-    Pings and pongs may be used to check the connection is alive or to estimate
-    latency.
-  * `{:text, text}` - a frame containing string data. Text frames must be
-    valid utf8. Elixir has wonderful support for utf8: `String.valid?/1`
-    can detect valid and invalid utf8.
-  """
-  @spec parse_message(Req.Response.t(), term()) ::
-          {:ok, Req.Response.t(), [Mint.WebSocket.frame()]}
-          | {:error, Req.Response.t(), any()}
-          | :unknown
-  def parse_message(%Req.Response{} = response, message) do
-    conn = Req.Response.get_private(response, :conn)
-    ref = Req.Response.get_private(response, :ref)
-    web_socket = Req.Response.get_private(response, :web_socket)
-
-    with {:ok, conn, responses} <- Mint.WebSocket.stream(conn, message),
-         {:ok, web_socket, frames} <- parse_message(responses, ref, web_socket, []) do
-      response =
-        response
-        |> Req.Response.put_private(:conn, conn)
-        |> Req.Response.put_private(:web_socket, web_socket)
-
-      {:ok, response, frames}
-    else
-      {:error, conn, reason} ->
-        {:error, Req.Response.put_private(response, :conn, conn), reason}
-
-      {:error, conn, reason, _responses} ->
-        {:error, Req.Response.put_private(response, :conn, conn), reason}
-
-      :unknown ->
-        :unknown
-    end
-  end
-
-  defp parse_message([{:data, ref, data} | rest], ref, web_socket, acc) do
-    case Mint.WebSocket.decode(web_socket, data) do
-      {:ok, web_socket, frames} -> parse_message(rest, ref, web_socket, Enum.concat(frames, acc))
-      {:error, web_socket, _reason} -> parse_message(rest, ref, web_socket, acc)
-    end
-  end
-
-  defp parse_message([], _ref, web_socket, acc), do: {:ok, web_socket, acc}
-
-  defp put_web_socket(request) do
-    case request.url.scheme do
-      "ws" -> put_web_socket(request, :http, :ws)
-      "wss" -> put_web_socket(request, :https, :wss)
-      _other -> request
-    end
-  end
-
-  defp put_web_socket(request, http_scheme, ws_scheme) do
-    request
-    |> Req.Request.put_private(:http_scheme, http_scheme)
-    |> Req.Request.put_private(:ws_scheme, ws_scheme)
-    |> Map.put(:adapter, __MODULE__)
-  end
-
-  def run(request) do
-    case request.into do
-      fun when is_function(fun, 2) -> run_web_socket_fun(request)
-      :self -> run_web_socket_self(request)
-      other -> {request, UnsupportedIntoError.exception(actual: other)}
-    end
-  end
-
-  defp run_web_socket_fun(request) do
-    callers = [self() | Process.get(:"$callers", [])]
-    parent = self()
-    parent_ref = make_ref()
-
-    spawn(fn ->
-      Process.put(:"$callers", callers)
-
-      case run_web_socket_self(request) do
-        {request, %Req.Response{status: 101} = response} ->
-          send(parent, {parent_ref, {request, response}})
-
-          {request, response} = run_web_socket_loop({request, response})
-
-          response =
-            Req.Response.update_private(response, :conn, nil, fn conn ->
-              {:ok, conn} = Mint.HTTP.close(conn)
-              conn
-            end)
-
-          {request, response}
-
-        {_request, _response_or_exception} = acc ->
-          send(parent, {parent_ref, acc})
-          acc
-      end
-    end)
-
-    receive(do: ({^parent_ref, result} -> result))
-  end
-
-  defp run_web_socket_loop({request, response}) do
-    fun = request.into
-
-    case parse_message(response, receive(do: (message -> message))) do
-      {:ok, response, frames} ->
-        case List.keytake(frames, :close, 0) do
-          nil ->
-            case fun.({:data, frames}, {request, response}) do
-              {:cont, frames, {request, response}} ->
-                case send_frames(response, frames) do
-                  {:ok, response} ->
-                    run_web_socket_loop({request, response})
-
-                  {:error, response, reason} ->
-                    case fun.({:error, reason}, {request, response}) do
-                      {:cont, acc} -> run_web_socket_loop(acc)
-                      {:halt, acc} -> acc
-                    end
-                end
-
-              {:cont, acc} ->
-                run_web_socket_loop(acc)
-
-              {:halt, frames, {request, response}} ->
-                case send_frames(response, frames) do
-                  {:ok, response} -> {request, response}
-                  {:error, response, _reason} -> {request, response}
-                end
-
-              {:halt, acc} ->
-                acc
-            end
-
-          {_close, []} ->
-            {request, response}
-
-          {_close, frames} ->
-            {_, acc} = fun.({:data, frames}, {request, response})
-            acc
-        end
-
-      {:error, response, reason} ->
-        case fun.({:error, reason}, {request, response}) do
-          {:cont, acc} -> run_web_socket_loop(acc)
-          {:halt, acc} -> acc
-        end
-
-      :unknown ->
-        run_web_socket_loop({request, response})
-    end
-  end
-
-  defp run_web_socket_self(request) do
-    with {:ok, conn} <- web_socket_connect(request),
-         {:ok, conn, web_socket, ref, status, headers} <- web_socket_upgrade(request, conn) do
-      response =
-        Req.Response.new(headers: headers, status: status)
-        |> Req.Response.put_private(:conn, conn)
-        |> Req.Response.put_private(:ref, ref)
-        |> Req.Response.put_private(:web_socket, web_socket)
-
-      {request, response}
-    else
-      {:error, exception} -> {request, exception}
-      {request, response_or_exception} -> {request, response_or_exception}
-    end
-  end
-
-  defp send_encoded(conn, ref, web_socket, encoded) do
-    case Mint.WebSocket.stream_request_body(conn, ref, encoded) do
-      {:ok, conn} -> {:ok, conn}
-      {:error, conn, reason} -> {:error, conn, web_socket, reason}
-    end
   end
 
   @doc """
@@ -496,69 +312,773 @@ defmodule ReqWebSocket do
     end
   end
 
-  defp web_socket_connect(request) do
-    %{host: host, port: port} = request.url
-    connect_options = Req.Request.get_option(request, :connect_options, [])
-    scheme = Req.Request.get_private(request, :http_scheme)
-
-    Mint.HTTP.connect(scheme, host, port, connect_options)
-  end
-
-  defp web_socket_upgrade(request, conn) do
-    headers =
-      for {name, values} <- request.headers,
-          value <- values do
-        {name, value}
+  @impl Req.Adapter
+  @spec stream(req, acc, fun, state) ::
+          {:ok, resp, acc, state}
+          | {:halt, resp, acc, state}
+          | {{:error, err}, resp, acc, state}
+        when req: Req.Request.t(),
+             resp: Req.Response.t(),
+             err: Exception.t(),
+             acc: term(),
+             fun: (event, resp, acc, state ->
+                     {:ok, resp, acc, state}
+                     | {:halt, resp, acc, state}
+                     | {{:error, err}, resp, acc, state}),
+             state: term(),
+             event:
+               {:status, non_neg_integer()}
+               | {:headers, [{binary(), binary()}]}
+               | {:data, binary()}
+               | {:trailers, [{binary(), binary()}]}
+  def stream(req, acc, fun, state) when is_function(fun, 4) do
+    # Mint derives the host header from the address, producing an invalid
+    # `::1:port` for IPv6 hosts, so set a bracketed one ourselves.
+    req =
+      if (req.url.host || "") =~ ":" do
+        Req.Request.put_new_header(req, "host", "[#{req.url.host}]")
+      else
+        req
       end
 
-    url = request.url
-    path = if url.query, do: url.path <> "?" <> url.query, else: url.path
-    scheme = Req.Request.get_private(request, :ws_scheme)
+    resp = Req.Response.new(status: nil, body: nil)
+    resp = put_in(resp.request, req)
 
-    case Mint.WebSocket.upgrade(scheme, conn, path, headers) do
-      {:ok, conn, ref} -> web_socket_upgrade(request, conn, ref)
-      {:error, _conn, exception} -> {:error, exception}
+    case connect(req) do
+      {:ok, conn} ->
+        case start_request(req, conn, acc) do
+          {:ok, conn, ref, acc} ->
+            case req.into do
+              :self ->
+                stream_into_self(req, conn, ref, resp, acc, fun, state)
+
+              _other ->
+                stream_response(req, conn, ref, resp, acc, fun, state)
+            end
+
+          {:error, conn, error, acc} ->
+            Mint.HTTP.close(conn)
+            {{:error, normalize_error(error)}, resp, acc, state}
+        end
+
+      {:error, exception} ->
+        {{:error, exception}, resp, acc, state}
     end
   end
 
-  defp web_socket_upgrade(request, conn, ref) do
+  defp encode_frame(conn, web_socket, frame) do
+    case Mint.WebSocket.encode(web_socket, frame) do
+      {:ok, _websocket, _encoded} = result -> result
+      {:error, web_socket, reason} -> {:error, conn, web_socket, reason}
+    end
+  end
+
+  defp encode_frames(conn, web_socket, frames) do
+    Enum.reduce_while(frames, {:ok, web_socket, <<>>}, fn frame, {_, web_socket, acc} ->
+      case encode_frame(conn, web_socket, frame) do
+        {:ok, web_socket, encoded} -> {:cont, {:ok, web_socket, acc <> encoded}}
+        {:error, conn, web_socket, reason} -> {:halt, {:error, conn, web_socket, reason}}
+      end
+    end)
+  end
+
+  defp put_websocket(request) do
+    case request.url.scheme do
+      "ws" -> put_websocket(request, :http, :ws)
+      "wss" -> put_websocket(request, :https, :wss)
+      _other -> request
+    end
+  end
+
+  defp put_websocket(request, http_scheme, ws_scheme) do
+    request
+    |> Req.Request.put_private(@http_scheme, http_scheme)
+    |> Req.Request.put_private(@ws_scheme, ws_scheme)
+    |> Map.put(:adapter, __MODULE__)
+  end
+
+  defp send_encoded(conn, ref, web_socket, encoded) do
+    case Mint.WebSocket.stream_request_body(conn, ref, encoded) do
+      {:ok, conn} -> {:ok, conn}
+      {:error, conn, reason} -> {:error, conn, web_socket, reason}
+    end
+  end
+
+  defp stream_response(req, conn, ref, resp, acc, fun, state) do
+    timeouts = %{
+      receive_timeout: req.options[:receive_timeout] || 15_000,
+      deadline: deadline(req.options[:request_timeout])
+    }
+
+    stream_fun = fn
+      {:status, status}, _conn, {resp, acc, state} ->
+        resp = put_in(resp.status, status)
+
+        case fun.({:status, status}, resp, acc, state) do
+          {:ok, resp, acc, state} ->
+            {:cont, {resp, acc, state}}
+
+          {:halt, resp, acc, state} ->
+            {:halt, {resp, acc, state}}
+
+          {{:error, exception}, resp, acc, state} ->
+            {:error, {resp, acc, state}, exception}
+        end
+
+      {:headers, headers}, _conn, {resp, acc, state} ->
+        resp = put_in(resp.headers, Req.Fields.new_without_normalize_with_duplicates(headers))
+
+        case fun.({:headers, headers}, resp, acc, state) do
+          {:ok, resp, acc, state} ->
+            {:cont, {resp, acc, state}}
+
+          {:halt, resp, acc, state} ->
+            {:halt, {resp, acc, state}}
+
+          {{:error, exception}, resp, acc, state} ->
+            {:error, {resp, acc, state}, exception}
+        end
+
+      {:data, datum}, _conn, {resp, acc, [data | state]} ->
+        {:cont, {resp, acc, [[{:data, ref, datum} | data] | state]}}
+
+      {:trailers, trailers}, _conn, {resp, acc, state} ->
+        resp =
+          put_in(resp.trailers, Req.Fields.new_without_normalize_with_duplicates(trailers))
+
+        case fun.({:trailers, trailers}, resp, acc, state) do
+          {:ok, resp, acc, state} ->
+            {:cont, {resp, acc, state}}
+
+          {:halt, resp, acc, state} ->
+            {:halt, {resp, acc, state}}
+
+          {{:error, exception}, resp, acc, state} ->
+            {:error, {resp, acc, state}, exception}
+        end
+    end
+
+    websocket_fun = fn
+      {:data, data}, conn, {resp, websocket, acc, state} ->
+        {:ok, websocket, data} = Mint.WebSocket.decode(websocket, data)
+
+        resp = Req.Response.put_private(resp, :conn, conn)
+        resp = Req.Response.put_private(resp, :web_socket, websocket)
+
+        case fun.({:data, data}, resp, acc, state) do
+          {:ok, resp, acc, state} ->
+            {:cont, {resp, websocket, acc, state}}
+
+          {:halt, resp, acc, state} ->
+            {:halt, {resp, websocket, acc, state}}
+
+          {{:error, exception}, resp, acc, state} ->
+            {:error, {resp, websocket, acc, state}, exception}
+        end
+    end
+
+    resp = Req.Response.put_private(resp, :ref, ref)
+
+    case recv_stream(conn, ref, {resp, acc, [[] | state]}, stream_fun, timeouts) do
+      {:ok, conn, {resp, acc, [data | state]}} when resp.status == 101 ->
+        {:ok, conn, websocket} =
+          Mint.WebSocket.new(conn, ref, resp.status, Req.Fields.get_list(resp.headers),
+            mode: :passive
+          )
+
+        case drain_entries(data, conn, ref, {resp, websocket, acc, state}, websocket_fun) do
+          {:ok, conn, acc} ->
+            case recv_stream(conn, ref, acc, websocket_fun, timeouts) do
+              {:ok, conn, {resp, _websocket, acc, state}} ->
+                Mint.HTTP.close(conn)
+                {:ok, resp, acc, state}
+
+              {:halt, {resp, _websocket, acc, state}} ->
+                {:halt, resp, acc, state}
+
+              {:error, {resp, _websocket, acc, state}, exception} ->
+                {{:error, exception}, resp, acc, state}
+            end
+
+          {:halt, _conn, {resp, _websocket, acc, state}} ->
+            {:halt, resp, acc, state}
+
+          {:error, _conn, {resp, _websocket, acc, state}, exception} ->
+            {{:error, exception}, resp, acc, state}
+        end
+
+      {:ok, _conn, {resp, acc, [_data | state]}} ->
+        {:ok, resp, acc, state}
+
+      {:halt, {resp, acc, [_data | state]}} ->
+        {:halt, resp, acc, state}
+
+      {:error, {resp, acc, [_data | state]}, exception} ->
+        {{:error, exception}, resp, acc, state}
+    end
+  end
+
+  defp stream_into_self(req, conn, ref, resp, acc, fun, state) do
+    timeouts = %{
+      receive_timeout: req.options[:receive_timeout] || 15_000,
+      deadline: deadline(req.options[:request_timeout])
+    }
+
+    case recv_status_and_headers(conn, ref, timeouts, nil, [], []) do
+      {:ok, conn, status, headers, rest} when status == 101 ->
+        resp = put_in(resp.status, status)
+
+        case fun.({:status, status}, resp, acc, state) do
+          {:ok, resp, acc, state} ->
+            resp =
+              put_in(resp.headers, Req.Fields.new_without_normalize_with_duplicates(headers))
+
+            case fun.({:headers, headers}, resp, acc, state) do
+              {:ok, resp, acc, state} ->
+                {:ok, conn, websocket} =
+                  Mint.WebSocket.new(conn, ref, status, headers, mode: :passive)
+
+                async = %Req.Response.Async{
+                  pid: self(),
+                  ref: ref,
+                  stream_fun: &parse_message/2,
+                  cancel_fun: start_owner(conn, ref, websocket, rest, timeouts)
+                }
+
+                resp = put_in(resp.body, async)
+                resp = Req.Response.put_private(resp, :conn, conn)
+                resp = Req.Response.put_private(resp, :ref, ref)
+                resp = Req.Response.put_private(resp, :web_socket, websocket)
+                {:ok, resp, acc, state}
+
+              {:halt, resp, acc, state} ->
+                Mint.HTTP.close(conn)
+                {:halt, resp, acc, state}
+
+              {{:error, exception}, resp, acc, state} ->
+                Mint.HTTP.close(conn)
+                {{:error, exception}, resp, acc, state}
+            end
+
+          {:halt, resp, acc, state} ->
+            Mint.HTTP.close(conn)
+            {:halt, resp, acc, state}
+
+          {{:error, exception}, resp, acc, state} ->
+            Mint.HTTP.close(conn)
+            {{:error, exception}, resp, acc, state}
+        end
+
+      {:ok, conn, status, headers, rest} ->
+        resp = put_in(resp.status, status)
+
+        case fun.({:status, status}, resp, acc, state) do
+          {:ok, resp, acc, state} ->
+            resp =
+              put_in(resp.headers, Req.Fields.new_without_normalize_with_duplicates(headers))
+
+            case fun.({:headers, headers}, resp, acc, state) do
+              {:ok, resp, acc, state} ->
+                async = %Req.Response.Async{
+                  pid: self(),
+                  ref: ref,
+                  stream_fun: &parse_message/2,
+                  cancel_fun: start_owner(conn, ref, rest, timeouts)
+                }
+
+                resp = put_in(resp.body, async)
+                {:ok, resp, acc, state}
+
+              {:halt, resp, acc, state} ->
+                Mint.HTTP.close(conn)
+                {:halt, resp, acc, state}
+
+              {{:error, exception}, resp, acc, state} ->
+                Mint.HTTP.close(conn)
+                {{:error, exception}, resp, acc, state}
+            end
+
+          {:halt, resp, acc, state} ->
+            Mint.HTTP.close(conn)
+            {:halt, resp, acc, state}
+
+          {{:error, exception}, resp, acc, state} ->
+            Mint.HTTP.close(conn)
+            {{:error, exception}, resp, acc, state}
+        end
+
+      {:error, conn, exception} ->
+        Mint.HTTP.close(conn)
+        {{:error, exception}, resp, acc, state}
+    end
+  end
+
+  defp connect(req) do
+    connect_options = req.options[:connect_options] || []
+
+    transport_opts =
+      Keyword.merge(
+        Keyword.take(connect_options, [:timeout]),
+        Keyword.get(connect_options, :transport_opts, [])
+      )
+
+    transport_opts =
+      if req.options[:inet6] == true or (req.url.host || "") =~ ":" do
+        Keyword.put(transport_opts, :inet6, true)
+      else
+        transport_opts
+      end
+
+    scheme = Req.Request.get_private(req, @http_scheme)
+
+    transport_opts =
+      if scheme == :https do
+        transport_opts
+      else
+        # when redirecting from https to http, we may still have these ssl options which we need
+        # to drop because mint errors otherwise
+        Keyword.drop(transport_opts, [:cacertfile, :certfile, :keyfile])
+      end
+
+    {address, port, address_options} =
+      if unix_socket = req.options[:unix_socket] do
+        {{:local, unix_socket}, 0, [hostname: req.url.host]}
+      else
+        {req.url.host, req.url.port, []}
+      end
+
+    options =
+      [
+        mode: :passive,
+        protocols: connect_options[:protocols] || [:http1],
+        transport_opts: transport_opts
+      ] ++ address_options
+
+    case Mint.HTTP.connect(scheme, address, port, options) do
+      {:ok, conn} ->
+        {:ok, conn}
+
+      {:error, exception} ->
+        {:error, normalize_error(exception)}
+    end
+  end
+
+  defp start_request(req, conn, acc) do
+    headers = Req.Fields.get_list(req.headers)
+
+    scheme = Req.Request.get_private(req, @ws_scheme)
+
+    case Mint.WebSocket.upgrade(scheme, conn, request_path(req.url), headers) do
+      {:ok, conn, ref} -> {:ok, conn, ref, acc}
+      {:error, conn, error} -> {:error, conn, error, acc}
+    end
+  end
+
+  defp request_path(url) do
+    path = url.path || "/"
+
+    if url.query in [nil, ""] do
+      path
+    else
+      path <> "?" <> url.query
+    end
+  end
+
+  defp drain_entries(entries, conn, ref, acc, fun) do
+    case handle_entries(entries, conn, ref, :headers, acc, fun) do
+      {:cont, conn, _phase, acc} ->
+        {:ok, conn, acc}
+
+      {:done, conn, acc} ->
+        {:ok, conn, acc}
+
+      {:halt, conn, acc} ->
+        {:halt, conn, acc}
+
+      {:error, conn, acc, error} ->
+        {:error, conn, acc, normalize_error(error)}
+    end
+  end
+
+  # Streams response entries into fun until :done, :halt, or error. Headers
+  # received after the first body chunk are passed as {:trailers, fields}.
+  defp recv_stream(conn, ref, acc, fun, timeouts) do
+    case recv_loop(conn, ref, :headers, acc, fun, timeouts) do
+      {:ok, conn, acc} ->
+        {:ok, conn, acc}
+
+      {:halt, conn, acc} ->
+        Mint.HTTP.close(conn)
+        {:halt, acc}
+
+      {:error, conn, acc, exception} ->
+        Mint.HTTP.close(conn)
+        {:error, acc, exception}
+    end
+  end
+
+  defp recv_loop(conn, ref, phase, acc, fun, timeouts) do
+    case Mint.WebSocket.recv(conn, 0, recv_timeout(timeouts)) do
+      {:ok, conn, entries} ->
+        case handle_entries(entries, conn, ref, phase, acc, fun) do
+          {:cont, conn, phase, acc} ->
+            recv_loop(conn, ref, phase, acc, fun, timeouts)
+
+          {:done, conn, acc} ->
+            {:ok, conn, acc}
+
+          {:halt, conn, acc} ->
+            {:halt, conn, acc}
+
+          {:error, conn, acc, error} ->
+            {:error, conn, acc, normalize_error(error)}
+        end
+
+      {:error, conn, error, entries} ->
+        case handle_entries(entries, conn, ref, phase, acc, fun) do
+          {:cont, conn, _phase, acc} ->
+            {:error, conn, acc, normalize_error(error)}
+
+          {:done, conn, acc} ->
+            {:ok, conn, acc}
+
+          {:halt, conn, acc} ->
+            {:halt, conn, acc}
+
+          {:error, conn, acc, entries_error} ->
+            {:error, conn, acc, normalize_error(entries_error)}
+        end
+    end
+  end
+
+  defp handle_entries([], conn, _ref, phase, acc, _fun) do
+    {:cont, conn, phase, acc}
+  end
+
+  defp handle_entries([entry | rest], conn, ref, phase, acc, fun) do
+    case entry do
+      {:status, ^ref, status} ->
+        apply_fun({:status, status}, rest, conn, ref, phase, acc, fun)
+
+      {:headers, ^ref, fields} when phase == :headers ->
+        apply_fun({:headers, fields}, rest, conn, ref, phase, acc, fun)
+
+      {:headers, ^ref, fields} ->
+        apply_fun({:trailers, fields}, rest, conn, ref, phase, acc, fun)
+
+      {:data, ^ref, data} ->
+        apply_fun({:data, data}, rest, conn, ref, :body, acc, fun)
+
+      {:done, ^ref} ->
+        {:done, conn, acc}
+
+      {:error, ^ref, error} ->
+        {:error, conn, acc, error}
+    end
+  end
+
+  defp apply_fun(event, rest, conn, ref, phase, acc, fun) do
+    case fun.(event, conn, acc) do
+      {:cont, acc} ->
+        handle_entries(rest, conn, ref, phase, acc, fun)
+
+      {:halt, acc} ->
+        {:halt, conn, acc}
+
+      {:error, acc, error} ->
+        {:error, conn, acc, error}
+    end
+  end
+
+  # into: :self receives status and headers synchronously, then hands the
+  # connection over to a spawned process that forwards Finch-shaped messages
+  # ({ref, {:data, data}}, {ref, :done}, etc.) to the caller's mailbox.
+  defp recv_status_and_headers(conn, ref, timeouts, status, headers, early_entries) do
+    case Mint.WebSocket.recv(conn, 0, recv_timeout(timeouts)) do
+      {:ok, conn, entries} ->
+        case split_status_and_headers(entries, ref, status, headers, early_entries) do
+          {:ok, status, headers, rest} ->
+            {:ok, conn, status, headers, rest}
+
+          {:cont, status, headers} ->
+            recv_status_and_headers(conn, ref, timeouts, status, headers, early_entries)
+        end
+
+      {:error, conn, error, _entries} ->
+        {:error, conn, normalize_error(error)}
+    end
+  end
+
+  defp split_status_and_headers([entry | rest], ref, status, headers, early_entries) do
+    case entry do
+      {:status, ^ref, status} ->
+        split_status_and_headers(rest, ref, status, headers, early_entries)
+
+      {:headers, ^ref, fields} ->
+        split_status_and_headers(rest, ref, status, headers ++ fields, early_entries)
+
+      {:data, ^ref, _} ->
+        split_status_and_headers(rest, ref, status, headers, [entry | early_entries])
+
+      {:done, ^ref} ->
+        {:ok, status, headers, rest}
+    end
+  end
+
+  defp split_status_and_headers([], _ref, status, headers, early_entries) do
+    {:cont, status, headers, early_entries}
+  end
+
+  defp start_owner(conn, ref, early_entries, timeouts) do
+    caller = self()
+
+    owner =
+      spawn_link(fn ->
+        receive do
+          {:go, conn} ->
+            {:ok, conn} = Mint.HTTP.set_mode(conn, :active)
+
+            if forward_entries(early_entries, ref, caller) == :cont do
+              owner_loop(conn, ref, caller, timeouts)
+            end
+        end
+      end)
+
+    {:ok, conn} = Mint.HTTP.controlling_process(conn, owner)
+    send(owner, {:go, conn})
+
+    fn ^ref ->
+      monitor = Process.monitor(owner)
+      send(owner, :cancel)
+
+      receive do
+        {:DOWN, ^monitor, _, _, _} ->
+          :ok
+      after
+        1000 ->
+          :ok
+      end
+
+      flush(ref)
+    end
+  end
+
+  defp start_owner(conn, ref, websocket, early_entries, timeouts) do
+    caller = self()
+
+    owner =
+      spawn_link(fn ->
+        receive do
+          {:go, conn, websocket} ->
+            {:ok, conn} = Mint.HTTP.set_mode(conn, :active)
+
+            if forward_entries(early_entries, ref, websocket, caller) == :cont do
+              owner_loop(conn, ref, websocket, caller, timeouts)
+            end
+        end
+      end)
+
+    {:ok, conn} = Mint.HTTP.controlling_process(conn, owner)
+    send(owner, {:go, conn, websocket})
+
+    fn ^ref ->
+      monitor = Process.monitor(owner)
+      send(owner, :cancel)
+
+      receive do
+        {:DOWN, ^monitor, _, _, _} ->
+          :ok
+      after
+        1000 ->
+          :ok
+      end
+
+      flush(ref)
+    end
+  end
+
+  defp owner_loop(conn, ref, caller, timeouts) do
     require Mint.HTTP
 
-    with message <-
-           receive(do: (message when Mint.HTTP.is_connection_message(conn, message) -> message)),
-         {:ok, conn, responses} <- Mint.WebSocket.stream(conn, message),
-         [{:status, ^ref, status}, {:headers, ^ref, headers}, {:done, ^ref}] <-
-           web_socket_upgrade_maybe_pop_data(conn, ref, responses),
-         {:ok, conn, web_socket} <- Mint.WebSocket.new(conn, ref, status, headers) do
-      {:ok, conn, web_socket, ref, status, headers}
-    else
-      {:error, conn, %Mint.WebSocket.UpgradeFailureError{} = error}
-      when error.status_code not in 200..299 ->
-        response =
-          Req.Response.new(headers: error.headers, status: error.status_code)
-          |> Req.Response.put_private(:conn, conn)
+    receive do
+      :cancel ->
+        Mint.HTTP.close(conn)
 
-        {request, response}
+      message when Mint.HTTP.is_connection_message(conn, message) ->
+        case Mint.HTTP.stream(conn, message) do
+          {:ok, conn, entries} ->
+            case forward_entries(entries, ref, caller) do
+              :cont ->
+                owner_loop(conn, ref, caller, timeouts)
 
-      {:error, _conn, exception} ->
-        {:error, exception}
+              :done ->
+                Mint.HTTP.close(conn)
+            end
 
-      {:error, _conn, exception, _responses} ->
-        {:error, exception}
+          {:error, conn, error, entries} ->
+            forward_entries(entries, ref, caller)
+            send(caller, {ref, {:error, normalize_error(error)}})
+            Mint.HTTP.close(conn)
+        end
+    after
+      timeouts.receive_timeout ->
+        send(caller, {ref, {:error, %Req.TransportError{reason: :timeout}}})
+        Mint.HTTP.close(conn)
     end
   end
 
-  defp web_socket_upgrade_maybe_pop_data(conn, ref, responses) do
-    case Enum.split_with(responses, &match?({:data, ^ref, _}, &1)) do
-      {[], _} ->
-        responses
+  defp owner_loop(conn, ref, websocket, caller, timeouts) do
+    require Mint.HTTP
 
-      {data, rest} ->
-        binary = for {:data, _, binary} <- data, reduce: <<>>, do: (acc -> acc <> binary)
-        socket = Mint.HTTP.get_socket(conn)
-        tag = if Mint.HTTP.get_private(conn, :scheme) == :ws, do: :tcp, else: :ssl
-        send(self(), {tag, socket, binary})
-        rest
+    receive do
+      :cancel ->
+        Mint.HTTP.close(conn)
+
+      message when Mint.HTTP.is_connection_message(conn, message) ->
+        case Mint.WebSocket.stream(conn, message) do
+          {:ok, conn, entries} ->
+            case forward_entries(entries, ref, websocket, caller) do
+              :cont ->
+                owner_loop(conn, ref, websocket, caller, timeouts)
+
+              :done ->
+                Mint.HTTP.close(conn)
+            end
+
+          {:error, conn, error, entries} ->
+            forward_entries(entries, ref, websocket, caller)
+            send(caller, {ref, {:error, normalize_error(error)}})
+            Mint.HTTP.close(conn)
+        end
+    after
+      timeouts.receive_timeout ->
+        send(caller, {ref, {:error, %Req.TransportError{reason: :timeout}}})
+        Mint.HTTP.close(conn)
     end
+  end
+
+  defp forward_entries([], _ref, _caller) do
+    :cont
+  end
+
+  defp forward_entries([entry | rest], ref, caller) do
+    case entry do
+      {:data, ^ref, data} ->
+        send(caller, {ref, {:data, data}})
+        forward_entries(rest, ref, caller)
+
+      {:headers, ^ref, fields} ->
+        send(caller, {ref, {:trailers, fields}})
+        forward_entries(rest, ref, caller)
+
+      {:done, ^ref} ->
+        send(caller, {ref, :done})
+        :done
+
+      {:error, ^ref, error} ->
+        send(caller, {ref, {:error, normalize_error(error)}})
+        :done
+    end
+  end
+
+  defp forward_entries([], _ref, _websocket, _caller) do
+    :cont
+  end
+
+  defp forward_entries([entry | rest], ref, websocket, caller) do
+    case entry do
+      {:data, ^ref, data} ->
+        case Mint.WebSocket.decode(websocket, data) do
+          {:ok, websocket, frames} ->
+            send(caller, {ref, {:data, frames}})
+            forward_entries(rest, ref, websocket, caller)
+
+          {:error, websocket, error} ->
+            send(caller, {ref, {:error, error}})
+            forward_entries(rest, ref, websocket, caller)
+
+          {:error, error} ->
+            send(caller, {ref, {:error, error}})
+            forward_entries(rest, ref, websocket, caller)
+        end
+
+      {:headers, ^ref, fields} ->
+        send(caller, {ref, {:trailers, fields}})
+        forward_entries(rest, ref, websocket, caller)
+
+      {:done, ^ref} ->
+        send(caller, {ref, :done})
+        :done
+
+      {:error, ^ref, error} ->
+        send(caller, {ref, {:error, normalize_error(error)}})
+        :done
+    end
+  end
+
+  defp parse_message(ref, {ref, {:data, data}}) do
+    {:ok, data}
+  end
+
+  defp parse_message(ref, {ref, :done}) do
+    {:ok, [:done]}
+  end
+
+  defp parse_message(ref, {ref, {:trailers, trailers}}) do
+    {:ok, [trailers: trailers]}
+  end
+
+  defp parse_message(ref, {ref, {:error, error}}) do
+    {:error, error}
+  end
+
+  defp parse_message(_ref, _message) do
+    :unknown
+  end
+
+  defp flush(ref) do
+    receive do
+      {^ref, _} ->
+        flush(ref)
+    after
+      0 ->
+        :ok
+    end
+  end
+
+  defp deadline(nil) do
+    nil
+  end
+
+  defp deadline(request_timeout) do
+    System.monotonic_time(:millisecond) + request_timeout
+  end
+
+  defp recv_timeout(%{receive_timeout: receive_timeout, deadline: nil}) do
+    receive_timeout
+  end
+
+  defp recv_timeout(%{receive_timeout: receive_timeout, deadline: deadline}) do
+    min(receive_timeout, max(deadline - System.monotonic_time(:millisecond), 0))
+  end
+
+  defp normalize_error(%Mint.TransportError{reason: reason}) do
+    %Req.TransportError{reason: reason}
+  end
+
+  defp normalize_error(%Mint.HTTPError{module: Mint.HTTP1, reason: reason}) do
+    %Req.HTTPError{protocol: :http1, reason: reason}
+  end
+
+  defp normalize_error(%Mint.HTTPError{module: Mint.HTTP2, reason: reason}) do
+    %Req.HTTPError{protocol: :http2, reason: reason}
+  end
+
+  defp normalize_error(error) when is_atom(error) do
+    %Req.TransportError{reason: error}
+  end
+
+  defp normalize_error(error) do
+    error
   end
 end
