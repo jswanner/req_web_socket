@@ -106,7 +106,7 @@ defmodule ReqWebSocket do
 
   Authentication options:
 
-  * `:auth` - sets request authentication (via [`auth`](`Req.Steps.auth/1`) step.)
+  * `:auth` - sets request authentication (via [`auth`](`Req.Auth`) step.)
 
     Can be one of:
 
@@ -156,7 +156,7 @@ defmodule ReqWebSocket do
               {:cont, {req, resp}}
             end
 
-  Response redirect options ([`redirect`](`Req.Steps.redirect/1`) step):
+  Response redirect options ([`redirect`](`Req.Redirect`) step):
 
   * `:redirect` - if set to `false`, disables automatic response redirects. Defaults to `true`.
 
@@ -168,15 +168,11 @@ defmodule ReqWebSocket do
 
   Other response options:
 
-  * `:http_errors` - how to handle HTTP 4xx/5xx error responses (via
-    [`handle_http_errors`](`Req.Steps.handle_http_errors/1`) step).
-    Can be one of the following:
+  * `:expect` - the expected HTTP response status (via `Req.Expect` step). Can be an integer, a range, or a list of integers/ranges.
 
-    * `:return` (default) - return the response
+  * `:checksum` - if set, this is the expected response body checksum, see `Req.Checksum`.
 
-    * `:raise` - raise an error
-
-  Retry options ([`retry`](`Req.Steps.retry/1`) step):
+  Retry options ([`retry`](`Req.Retry`) step):
 
   * `:retry` - can be one of the following:
 
